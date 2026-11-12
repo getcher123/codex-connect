@@ -1,0 +1,4 @@
+interface:
+  display_name: "Codex Connect"
+  short_description: "Чтение и отправка сообщений в Codex для VS Code"
+  default_prompt: "Используй $codex-connect, чтобы найти нужный диалог Codex в VS Code, прочитать его состояние и передать моё сообщение."
