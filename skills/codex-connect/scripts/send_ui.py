@@ -245,6 +245,18 @@ def parse_ui_result(call, digest, probe):
                       last_confirmed_phase="ui_dispatched")
 
 
+def ui_time_budget(deadline, monotonic_now, utc_now):
+    """Keep the existing helper/outer bounds; reserve time to return JSON."""
+    available = deadline - monotonic_now
+    if not math.isfinite(available) or available <= 3:
+        raise UiSendError("UI_BUDGET_EXHAUSTED")
+    return {
+        "hard_timeout_seconds": available - 1,
+        "soft_deadline_unix_ms": int((utc_now + available - 3) * 1000),
+        "soft_budget_ms": int((available - 3) * 1000),
+    }
+
+
 def invoke_ui(args, message, digest, deadline):
     powershell = args.powershell or shutil.which("powershell.exe")
     if not powershell:
@@ -269,25 +281,45 @@ def invoke_ui(args, message, digest, deadline):
         for key in list(env):
             if key.upper() == "PSMODULEPATH":
                 del env[key]
-        started_at_ms = int(time.time() * 1000)
-        timeout = remaining(deadline, 16)
+        started_monotonic = time.monotonic()
+        started_utc = time.time()
+        budget = ui_time_budget(deadline, started_monotonic, started_utc)
+        started_at_ms = int(started_utc * 1000)
+        command.extend([
+            "-UiDeadlineUnixMs", str(budget["soft_deadline_unix_ms"]),
+            "-UiBudgetMilliseconds", str(budget["soft_budget_ms"]),
+        ])
         try:
             call = subprocess.run(
                 command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                text=True, encoding="utf-8", errors="replace",
+                timeout=budget["hard_timeout_seconds"],
                 env=env, check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             # subprocess.run includes process creation, communication and wait.
             # An OSError can occur after the child already invoked Submit.
             # Neither that error nor a timeout proves that nothing was sent.
+            timed_out = isinstance(exc, subprocess.TimeoutExpired)
             raise UiSendError(
-                "ui_process_unavailable", phase="outcome_unknown",
+                "UI_PROCESS_TIMEOUT" if timed_out else "UI_PROCESS_IO_ERROR",
+                phase="outcome_unknown",
                 outcome="unknown", submit_attempted=None,
-                last_confirmed_phase="ui_dispatched", cause=type(exc).__name__,
+                last_confirmed_phase="ui_dispatched",
+                cause="TimeoutExpired" if timed_out else "OSError",
+                inner_ui_timed_out=timed_out,
+                ui_elapsed_ms=max(0, int((time.monotonic() - started_monotonic) * 1000)),
                 enqueue_started_at_ms=started_at_ms,
             ) from exc
-        result = parse_ui_result(call, digest, args.probe)
+        elapsed_ms = max(0, int((time.monotonic() - started_monotonic) * 1000))
+        try:
+            result = parse_ui_result(call, digest, args.probe)
+        except UiSendError as exc:
+            # Missing child diagnostics do not prove absence of a PS deadline.
+            exc.result.update(ui_elapsed_ms=elapsed_ms)
+            raise
+        result["ui_elapsed_ms"] = elapsed_ms
+        result["inner_ui_timed_out"] = result.get("error_code") == "UI_DEADLINE_EXCEEDED"
         stamp = result.get("submit_started_at_ms")
         if (result.get("phase") == "ui_invoked"
                 and (not isinstance(stamp, (int, float)) or isinstance(stamp, bool)
@@ -360,6 +392,8 @@ def run(args):
             if result.get("phase") != "ui_invoked":
                 return {**metadata, **result, "retry_safe": False}
         # Observation is read-only and must not hold the desktop input lock.
+        # --wait is an upper bound: slow UI navigation consumes the shared
+        # wait+24 helper budget and can shorten this observation window.
         wait_deadline = min(deadline, time.monotonic() + args.wait)
         observation_error = None
         while time.monotonic() < wait_deadline:
@@ -402,7 +436,7 @@ def parser():
     value.add_argument("--expect-cwd", required=True)
     value.add_argument("--message-file", required=True)
     value.add_argument("--wait", type=float, default=15,
-                       help="Read-only delivery observation in seconds (0..60)")
+                       help="Maximum read-only observation seconds (0..60); slow UI can shorten it within the shared wait+24 deadline")
     value.add_argument("--probe", action="store_true", help="Select/check the existing UI only; never enter or send text")
     value.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     value.add_argument("--adapter", default=str(SCRIPT_DIR / "codex_connect.py"))
