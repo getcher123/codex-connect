@@ -20,10 +20,20 @@ import sys
 import time
 import uuid
 
-EXTENSION_VERSION = "26.1106.51428"
-CLI_VERSION = "0.167.0-alpha.4.1"
-SNAPSHOT_VERSION = 11
+EXTENSION_VERSION = "26.1111.21308"
+CLI_VERSION = "0.169.0-alpha.11.1"
+SNAPSHOT_VERSION = 13
+SUPPORTED_BACKENDS = {
+    "26.1106.51428": {"cli_version": "0.167.0-alpha.4.1", "snapshot_version": 11,
+                      "queue_supported": True},
+    "26.1111.21308": {"cli_version": "0.169.0-alpha.11.1", "snapshot_version": 13,
+                      "queue_supported": False},
+}
+SUPPORTED_SNAPSHOT_VERSIONS = frozenset(value["snapshot_version"]
+                                      for value in SUPPORTED_BACKENDS.values())
 MAX_FRAME = 8 * 1024 * 1024
+MAX_RECEIVE_FRAME = 32 * 1024 * 1024
+MAX_OUTPUT_CHARS = 262144
 UUID_PATTERN = r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}"
 
 
@@ -71,8 +81,11 @@ def resolve_thread(codex_home, thread_id=None, title=None):
 
 
 class IPCClient:
-    def __init__(self, socket_path, timeout=5.0):
+    def __init__(self, socket_path, timeout=5.0, deadline=None):
         self.path, self.timeout = str(socket_path), timeout
+        self.deadline = deadline
+        self.phase = "connect"
+        self.last_observation = None
         self.sock = None
         self.client_id = None
         self.following = set()
@@ -83,8 +96,8 @@ class IPCClient:
         if not hasattr(socket, "AF_UNIX"):
             raise BridgeError("unsupported_platform", "Run the adapter inside Linux/WSL.")
         self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.sock.settimeout(self.timeout)
         try:
+            self.sock.settimeout(self.remaining())
             self.sock.connect(self.path)
             result = self.request("initialize", 0, {"clientType": "codex-connect"},
                                   source="initializing-client")
@@ -100,6 +113,15 @@ class IPCClient:
     def __exit__(self, *args):
         self.close()
 
+    def remaining(self, timeout=None):
+        remaining = self.timeout if timeout is None else timeout
+        if self.deadline is not None:
+            remaining = min(remaining, self.deadline - time.monotonic())
+        if remaining <= 0:
+            raise BridgeError("ipc_timeout", "The bounded IPC operation deadline expired.",
+                              phase=self.phase)
+        return remaining
+
     def send_frame(self, message):
         raw = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         if len(raw) > MAX_FRAME:
@@ -113,17 +135,20 @@ class IPCClient:
             if remaining <= 0:
                 raise TimeoutError("IPC deadline exceeded")
             self.sock.settimeout(remaining)
-            chunk = self.sock.recv(count - len(self.buffer))
+            chunk = self.sock.recv(min(65536, count - len(self.buffer)))
             if not chunk:
                 raise BridgeError("ipc_closed", "The extension closed the IPC connection.")
             self.buffer.extend(chunk)
 
     def receive(self, deadline):
+        if self.deadline is not None:
+            deadline = min(deadline, self.deadline)
         while True:
             self._fill(4, deadline)
             size = struct.unpack("<I", self.buffer[:4])[0]
-            if not 0 < size <= MAX_FRAME:
-                raise BridgeError("frame_too_large", "Invalid IPC frame size.", size=size)
+            if not 0 < size <= MAX_RECEIVE_FRAME:
+                raise BridgeError("frame_too_large", "Invalid IPC frame size.", size=size,
+                                  maximum=MAX_RECEIVE_FRAME)
             self._fill(size + 4, deadline)
             raw = bytes(self.buffer[4:size + 4])
             del self.buffer[:size + 4]
@@ -150,13 +175,20 @@ class IPCClient:
             return message
 
     def request(self, method, version, params, source=None):
+        self.phase = method
+        remaining = self.remaining()
+        self.sock.settimeout(remaining)
         request_id = str(uuid.uuid4())
         self.send_frame({"type": "request", "requestId": request_id,
                          "sourceClientId": source or self.client_id, "version": version,
-                         "method": method, "params": params, "timeoutMs": int(self.timeout * 1000)})
-        deadline = time.monotonic() + self.timeout
+                         "method": method, "params": params, "timeoutMs": max(1, int(remaining * 1000))})
+        deadline = time.monotonic() + remaining
         while True:
-            message = self.receive(deadline)
+            try:
+                message = self.receive(deadline)
+            except (TimeoutError, socket.timeout) as exc:
+                raise BridgeError("ipc_timeout", "The IPC request did not answer before its deadline.",
+                                  phase=method) from exc
             if message.get("type") == "response" and message.get("requestId") == request_id:
                 if message.get("method") != method or message.get("resultType") != "success":
                     raise BridgeError("ipc_request_failed", "IPC request was not handled successfully.",
@@ -179,11 +211,18 @@ class IPCClient:
     def snapshot(self, thread_id, owner=None, timeout=None):
         thread_id = valid_thread(thread_id)
         owner = owner or self.owner(thread_id)
+        self.phase = "snapshot"
+        remaining = self.remaining(timeout)
+        self.sock.settimeout(remaining)
         self.following.add((thread_id, owner))
         self._follow(thread_id, owner, True)
-        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        deadline = time.monotonic() + remaining
         while True:
-            message = self.receive(deadline)
+            try:
+                message = self.receive(deadline)
+            except (TimeoutError, socket.timeout) as exc:
+                raise BridgeError("ipc_timeout", "No matching live snapshot arrived before its deadline.",
+                                  phase="snapshot") from exc
             params = message.get("params") or {}
             if not (message.get("type") == "broadcast"
                     and message.get("method") == "thread-stream-state-changed"
@@ -194,18 +233,24 @@ class IPCClient:
             change = params.get("change")
             if not isinstance(change, dict):
                 raise BridgeError("invalid_frame", "IPC state change must be an object.")
-            if message.get("version") != SNAPSHOT_VERSION:
+            if message.get("version") not in SUPPORTED_SNAPSHOT_VERSIONS:
                 raise BridgeError("unsupported_protocol", "Unknown snapshot protocol version.",
-                                  observed=message.get("version"), expected=SNAPSHOT_VERSION)
+                                  observed=message.get("version"), expected=sorted(SUPPORTED_SNAPSHOT_VERSIONS))
             if change.get("type") != "snapshot":
                 continue
             state = change.get("conversationState")
             if not isinstance(state, dict) or state.get("id") != thread_id:
                 raise BridgeError("target_mismatch", "Snapshot identity does not match the requested thread.")
+            self.last_observation = {
+                "received_at_ms": int(time.time() * 1000),
+                "snapshot_version": message["version"],
+                "freshness": "received_in_current_request",
+                "source_timestamp_known": False,
+            }
             return state
 
     def collect_followed(self, duration=1.0):
-        deadline = time.monotonic() + duration
+        deadline = time.monotonic() + self.remaining(duration)
         try:
             while time.monotonic() < deadline:
                 self.receive(deadline)
@@ -216,12 +261,16 @@ class IPCClient:
     def close(self):
         if self.sock is None:
             return
-        self.sock.settimeout(0.2)
+        cleanup_deadline = time.monotonic() + 0.2
         for thread_id, owner in self.following:
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining <= 0:
+                break
             try:
+                self.sock.settimeout(remaining)
                 self._follow(thread_id, owner, False)
             except (OSError, BridgeError):
-                pass
+                break
         self.sock.close()
         self.sock = None
 
@@ -302,23 +351,55 @@ def valid_timestamp(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value < 2 ** 53
 
 
-def summarize_state(state, limit=3, max_chars=2000):
+def summarize_metadata(state, observation=None):
+    """Read-only metadata; malformed/missing pending state must never become []."""
+    if not isinstance(state, dict):
+        raise BridgeError("invalid_snapshot", "Conversation state must be an object.")
+    requests = state.get("requests")
+    pending_known = isinstance(requests, list) and all(
+        isinstance(item, dict) and isinstance(item.get("method"), str)
+        for item in requests)
+    # This field is optional in the validated v11/v13 schema. Malformed values
+    # remain unknown, and a nonempty container always blocks a new submission.
+    unconfirmed = state.get("unconfirmedTurnSubmissions", [])
+    unconfirmed_count = len(unconfirmed) if isinstance(unconfirmed, (list, dict)) else None
+    status = state.get("threadRuntimeStatus")
+    result = {
+        "source": "live_extension_snapshot", "thread_id": state.get("id"),
+        "title": state.get("title"), "cwd": state.get("cwd"),
+        "runtime_status": status if isinstance(status, dict) else None,
+        "pending_request_methods": [item["method"] for item in requests] if pending_known else None,
+        "pending_request_count": len(requests) if isinstance(requests, list) else None,
+        "unconfirmed_submission_count": unconfirmed_count,
+        "pending_state_known": pending_known and unconfirmed_count is not None,
+        "history_mode": state.get("historyMode"), "ui_focus_confirmed": False,
+    }
+    if isinstance(observation, dict):
+        result["observation"] = {key: observation[key] for key in (
+            "received_at_ms", "snapshot_version", "freshness", "source_timestamp_known")
+            if key in observation}
+    return result
+
+
+def summarize_state(state, limit=3, max_chars=2000, observation=None):
     turns = extract_turns(state)
     shown = []
-    budget = 60000
-    for turn in (turns[-limit:] if limit else []):
+    # Reserve the output budget for the newest turn first. Earlier history must
+    # not truncate the new user message we are trying to correlate.
+    budget = min(MAX_OUTPUT_CHARS, max(60000, max_chars + 16000))
+    for turn in reversed(turns[-limit:] if limit else []):
         messages = []
-        for message in turn["messages"][-40:]:
+        selected = turn["messages"][-40:]
+        users = [message for message in turn["messages"] if message["role"] == "user"]
+        if users and not any(message["role"] == "user" for message in selected):
+            selected = users[:1] + selected[-39:]
+        for message in selected:
             text = message["text"][:min(max_chars, budget)]
             budget -= len(text)
             messages.append({**message, "text": text, "truncated": len(text) < len(message["text"])})
         shown.append({**turn, "messages": messages})
-    return {"source": "live_extension_snapshot", "thread_id": state.get("id"),
-            "title": state.get("title"), "cwd": state.get("cwd"),
-            "runtime_status": state.get("threadRuntimeStatus"),
-            "pending_request_methods": [r.get("method") for r in state.get("requests", []) if isinstance(r, dict)],
-            "history_mode": state.get("historyMode"), "loaded_turn_count": len(turns),
-            "turns": shown, "ui_focus_confirmed": False}
+    return {**summarize_metadata(state, observation), "loaded_turn_count": len(turns),
+            "turns": list(reversed(shown))}
 
 
 def detect_bundled_cli(explicit=None):
@@ -330,8 +411,12 @@ def detect_bundled_cli(explicit=None):
                 continue
             try:
                 args = (pid / "cmdline").read_bytes().split(b"\0")
+                # Resolve executables only for app-server candidates. Resolving
+                # every /proc executable can enter unrelated mounted filesystems.
+                if b"app-server" not in args:
+                    continue
                 binary = (pid / "exe").resolve(strict=True)
-                if b"app-server" not in args or not any(p.startswith("openai.chatgpt-") for p in binary.parts):
+                if not any(p.startswith("openai.chatgpt-") for p in binary.parts):
                     continue
                 candidates.setdefault(str(binary), []).append(int(pid.name))
             except (OSError, RuntimeError):
@@ -348,17 +433,18 @@ def detect_bundled_cli(explicit=None):
         raise BridgeError("ambiguous_backend", "Several extension binaries are active; select one explicitly.",
                           candidates=sorted(candidates))
     match = re.search(r"/openai\.chatgpt-(\d+\.\d+\.\d+)-[^/]+/bin/[^/]+/codex$", selected)
-    if not match or match.group(1) != EXTENSION_VERSION:
+    compatibility = SUPPORTED_BACKENDS.get(match.group(1)) if match else None
+    if compatibility is None:
         raise BridgeError("unsupported_extension", "This extension version has not been validated.",
-                          expected=EXTENSION_VERSION, observed=match.group(1) if match else None)
+                          expected=sorted(SUPPORTED_BACKENDS), observed=match.group(1) if match else None)
     try:
         version = subprocess.run([selected, "--version"], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise BridgeError("version_unknown", "Cannot verify the bundled CLI version.") from exc
-    if version.returncode != 0 or version.stdout.strip() != "codex-cli " + CLI_VERSION:
+    if version.returncode != 0 or version.stdout.strip() != "codex-cli " + compatibility["cli_version"]:
         raise BridgeError("unsupported_cli", "The bundled CLI version does not match the validated version.",
-                          expected=CLI_VERSION)
-    return {"path": selected, "extension_version": match.group(1), "cli_version": CLI_VERSION,
+                          expected=compatibility["cli_version"])
+    return {"path": selected, "extension_version": match.group(1), **compatibility,
             "pids": sorted(candidates[selected]), "compatible": True}
 
 
@@ -454,26 +540,43 @@ def run(args):
     if args.command == "doctor":
         result = {"codex_home": str(codex_home), "socket": str(socket_path),
                   "socket_exists": socket_path.is_socket(), "state_exists": (codex_home / "state_5.sqlite").is_file(),
-                  "validated_snapshot_version": SNAPSHOT_VERSION}
+                  "validated_snapshot_version": SNAPSHOT_VERSION,
+                  "validated_snapshot_versions": sorted(SUPPORTED_SNAPSHOT_VERSIONS)}
         try:
             result["backend"] = detect_bundled_cli(args.codex_bin)
         except BridgeError as exc:
             result["backend"] = {"compatible": False, "error": exc.code, **exc.details}
+        result["ipc"] = {"status": "unavailable", "reason": "socket_missing", "scope": "handshake_only"}
+        if result["socket_exists"]:
+            try:
+                budget = min(args.timeout, 3.0)
+                with IPCClient(socket_path, budget, deadline=time.monotonic() + budget):
+                    result["ipc"] = {"status": "responsive", "scope": "handshake_only",
+                                     "received_at_ms": int(time.time() * 1000)}
+            except (BridgeError, OSError, TimeoutError) as exc:
+                result["ipc"] = {"status": "unavailable", "scope": "handshake_only",
+                                 "reason": getattr(exc, "code", type(exc).__name__)}
+        result["healthy"] = result["backend"].get("compatible") is True and result["ipc"]["status"] == "responsive"
         return result
     if args.command == "send" and socket_path.resolve() != (codex_home / "ipc" / "ipc.sock").resolve():
         raise BridgeError("socket_home_mismatch", "Sending requires the socket inside the selected Codex home.")
     record = None
-    if args.command in ("read", "send") or args.title:
+    if args.command in ("read", "status", "send") or args.title:
         record = resolve_thread(codex_home, getattr(args, "thread", None), args.title)
+    # Reading validates the received snapshot protocol itself. It does not need
+    # /proc enumeration or a subprocess running the outbound CLI's --version.
     backend = detect_bundled_cli(args.codex_bin) if args.command == "send" else None
-    with IPCClient(socket_path, args.timeout) as client:
+    if args.command == "send" and backend.get("queue_supported") is not True:
+        raise BridgeError("queue_transport_unsupported", "Native queue delivery is not validated for this backend; use the verified UI sender.",
+                          phase="failed_before_send", retry_safe=True)
+    with IPCClient(socket_path, args.timeout, deadline=time.monotonic() + args.timeout) as client:
         if args.command == "discover":
-            candidates = [record["id"]] if record else client.collect_followed()
+            candidates = [record["id"]] if record else client.collect_followed(min(1.0, args.timeout / 4))
             results = []
             for thread_id in candidates[:args.limit]:
                 try:
                     state = client.snapshot(thread_id)
-                    summary = summarize_state(state, limit=0)
+                    summary = summarize_state(state, limit=0, observation=client.last_observation)
                     summary.pop("turns")
                     results.append(summary)
                 except (BridgeError, OSError, TimeoutError) as exc:
@@ -482,8 +585,10 @@ def run(args):
                     "truncated": len(candidates) > args.limit}
         owner = client.owner(record["id"])
         state = client.snapshot(record["id"], owner)
+        if args.command == "status":
+            return {**summarize_metadata(state, client.last_observation), "history_inspected": False}
         if args.command == "read":
-            return summarize_state(state, args.limit, args.max_chars)
+            return summarize_state(state, args.limit, args.max_chars, client.last_observation)
         check_send_target(state, record, args.expect_cwd, args.title)
         message = args.message
         if args.message_file is not None:
@@ -501,6 +606,9 @@ def run(args):
         receipt = {"thread_id": record["id"], "baseline_turn_ids": sorted(baseline),
                    "message_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest()}
         receipt["enqueue_started_at_ms"] = int(time.time() * 1000)
+        # The --wait observation has its own explicit budget, after preflight.
+        # Expiration of the initial read budget must not trigger a resend.
+        client.deadline = None
         try:
             queued = queue_message(backend["path"], record["id"], message, codex_home)
         except BridgeError as exc:
@@ -527,21 +635,22 @@ def parser():
     p.add_argument("--codex-home", default=os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
     p.add_argument("--socket", help="Explicit existing extension Unix socket")
     p.add_argument("--codex-bin", help="Select one active bundled extension binary")
-    p.add_argument("--timeout", type=bounded(1, 20, float), default=5.0)
+    p.add_argument("--timeout", type=bounded(1, 60, float), default=5.0,
+                   help="Overall initial IPC read/discovery deadline in seconds")
     commands = p.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor", help="Inspect safe local metadata; no session starts")
     discover = commands.add_parser("discover", help="List live UI-retained candidates, not keyboard focus")
     discover.add_argument("--title", help="Exact current display name")
-    discover.add_argument("--limit", type=bounded(1, 20), default=10)
-    for name in ("read", "send"):
+    discover.add_argument("--limit", type=bounded(1, 200), default=10)
+    for name in ("read", "status", "send"):
         command = commands.add_parser(name)
         target = command.add_mutually_exclusive_group(required=True)
         target.add_argument("--thread", help="Explicit thread UUID")
         target.add_argument("--title", help="Exact unique current display name")
         if name == "read":
             command.add_argument("--limit", type=bounded(1, 20), default=3)
-            command.add_argument("--max-chars", type=bounded(100, 16000), default=2000)
-        else:
+            command.add_argument("--max-chars", type=bounded(100, 200000), default=2000)
+        elif name == "send":
             text = command.add_mutually_exclusive_group(required=True)
             text.add_argument("--message")
             text.add_argument("--message-file", help="UTF-8 text file; copied exactly, not executed")

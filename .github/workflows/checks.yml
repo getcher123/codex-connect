@@ -21,5 +21,16 @@ jobs:
       - name: Test isolated protocol and queue behavior
         run: python3 -m unittest discover -s tests -v
       - name: Compile adapter
-        run: python3 -m py_compile skills/codex-connect/scripts/codex_connect.py
+        run: python3 -m py_compile skills/codex-connect/scripts/codex_connect.py skills/codex-connect/scripts/send_ui.py
+
+  windows-guards:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Test pure Windows UI guards without desktop interaction
+        shell: powershell
+        run: .\tests\test_send_ui_windows.ps1
 
