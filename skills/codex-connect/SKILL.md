@@ -1,6 +1,6 @@
 ---
 name: codex-connect
-description: Read conversations and send explicitly requested text to an existing Codex VS Code session through local IPC and bundled codex queue. Use when the user asks to connect to the running IDE agent, inspect its messages or status, select a named conversation, or relay a message, including via Remote Desktop Commander and WSL. Operates existing sessions without starting a second agent backend.
+description: Read conversations and send explicitly requested text to an existing Codex VS Code session through live local IPC, a guarded Windows UI sender from WSL, or native queue for the validated legacy backend. Use when the user asks to connect to the running IDE agent, inspect its messages or status, select a named conversation, or relay a message, including via Remote Desktop Commander and WSL. Operates existing sessions without starting a second agent backend.
 ---
 
 # Codex Connect
@@ -8,20 +8,24 @@ description: Read conversations and send explicitly requested text to an existin
 ## Выполнить задачу
 
 1. Определить машину и среду нужного VS Code. Выполнять скрипт в той же Linux/WSL-среде и от того же пользователя. Для удалённой Windows прочитать [remote-desktop.md](references/remote-desktop.md).
-2. Из каталога skill запустить `python3 scripts/codex_connect.py doctor`. Проверить binary, версию и socket. При несовместимости прочитать [protocol.md](references/protocol.md); не подменять CLI и не запускать другой app-server.
+2. Для новой среды запустить `python3 scripts/codex_connect.py doctor` и прочитать [матрицу совместимости](references/protocol.md). Handshake не доказывает готовность конкретного диалога. Не повторять CLI version probe перед каждым чтением; не подменять CLI и не запускать другой app-server.
 3. Запустить `python3 scripts/codex_connect.py discover`. Для названного пользователем диалога использовать точный `--title`. Не выбирать самый новый диалог и не считать список открытых диалогов указанием фокуса.
-4. Прочитать выбранную сессию командой `read` с `--thread` или `--title`. Проверить ID, название, cwd, runtime status и pending requests.
-5. Если пользователь попросил передать сообщение, выполнить `send` один раз с тем же адресатом. Для произвольного текста предпочесть `--message-file`; передавать аргументы без shell-интерпретации. Закрепить каталог через `--expect-cwd`, если он известен.
-6. Для короткой задачи использовать `--wait` и проверить phase/ответ. Если результат не подтверждён, читать существующий диалог, не отправлять заново.
+4. Для состояния вызвать `status`, для сообщений — `read` с `--thread` или `--title`. Проверить UUID, название, cwd, runtime status, `pending_state_known`, счётчики запросов и неподтверждённых отправок. Неизвестное состояние не считать пустым.
+5. Если пользователь попросил передать сообщение, выбрать проверенный транспорт. Windows + WSL: [windows-ui.md](references/windows-ui.md). Native `send` разрешён только legacy-версии из матрицы. Предпочесть `--message-file`, массив argv без shell-интерпретации и точный `--expect-cwd`. Не переключать транспорт после неопределённого исхода.
+6. При MSI Remote Agent сохранить собственный `operation_id` до первого `codex_send_message`. Передать точные UUID/title/cwd и текст. После timeout читать `codex_delivery_status` по исходному ID; не создавать новый ID для повтора неизвестной операции. Для короткой задачи использовать `--wait`, дальше наблюдать существующий диалог.
 7. Сообщить адресата, факт постановки/обработки и подтверждённый ответ. Различать отказ до отправки и неопределённый исход после запуска queue.
 
 Запрос пользователя передать текст или выполнить тест в указанном диалоге достаточен для отправки. Не запрашивать то же разрешение повторно. Без запроса на отправку ограничиться чтением.
 
 ## Интерфейс
 
-Команды: `doctor`, `discover`, `read`, `send`. Перед нестандартным вызовом прочитать `--help` нужной подкоманды.
+Команды: `doctor`, `discover`, `status`, `read`, legacy `send`; UI helper — `scripts/send_ui.py`. Перед нестандартным вызовом прочитать `--help` нужной подкоманды.
 
 Общие параметры `--codex-home`, `--socket`, `--codex-bin`, `--timeout` размещать перед подкомандой. По умолчанию использовать CODEX_HOME или домашний каталог текущего пользователя. Выбирать binary работающего расширения, а не самый свежий файл на диске.
+
+`--timeout` ограничивает начальную IPC-операцию целиком (1–60 секунд). Discovery принимает до 200 кандидатов; read — до 20 ходов и 200000 символов на сообщение при отдельном общем лимите вывода. UI message file — до 32768 байт UTF-8. Скрипты UI располагаются рядом с IPC-адаптером; не добавлять личные пути в общий пакет.
+
+`status` не извлекает историю, но получает обычный snapshot. Read/status не запускают CLI. Receive timestamp не является временем генерации источника.
 
 Результат — JSON. Читать небольшой хвост пользовательских и ассистентских сообщений; лимиты увеличивать только для задачи. Не выгружать reasoning, tool logs, настройки и вложения.
 
@@ -33,12 +37,15 @@ description: Read conversations and send explicitly requested text to an existin
 - При active, waitingOnUserInput, неизвестном состоянии или отсутствии владельца вернуть установленное состояние. Не прерывать задачу и не отвечать за пользователя.
 - Если owner не найден, предложить открыть существующий диалог в IDE. Не выполнять resume, newChat или запуск второго сервера как скрытую замену подключения.
 - Различать queued, observed, completed, ambiguous и outcome_unknown. Сохранять возвращённые идентификаторы; queued не означает полученный ответ.
-- После timeout или неоднозначной корреляции читать историю. Не повторять queue автоматически.
+- Квитанция MSI должна существовать до preflight. `refresh=false` читает её без IPC; обычный status при занятой блокировке возвращает сохранённый этап; `refresh=true` явно сверяет неизвестный исход.
+- `not_found`, queued, exit=0 и пустой composer не доказывают отсутствие или наличие доставки. Сохранять исходный ID, не снимать блокировки автоматически.
+- UI проверяет контекст WSL, уникальное название, UUID/cwd, видимый документ и composer. Действия адресуются UIA-элементам без клавиатурного ввода. Реальный черновик блокирует ввод; `staged_not_submitted` требует разбора перед новой попыткой.
+- После timeout или неоднозначной корреляции читать историю. Не повторять отправку автоматически. Подтверждение требует одного нового хода с полным текстом и известным временем не раньше отправки; для UI допускается только CRLF → LF.
 - При изменении версии прекратить операцию и зафиксировать несовместимость.
 - При завершении отписаться и закрыть socket.
 
 ## Граница поддержки
 
-Проверенный сценарий: Linux/WSL, работающий Codex, загруженный свободный диалог, текстовое сообщение и чтение ответа. Использовать native queue для отправки и внутренний IPC для чтения. Не добавлять private start-turn, steer, interrupt, approval или запись в БД.
+Linux/WSL: snapshot 11/13, legacy native queue и отдельный Windows + WSL UI sender. Точный уровень live-проверки указан в корневом state.md; офлайн-тест не заменяет реальный Submit. Idle и cooperative UI mutex не блокируют ручные действия человека. Обновление GitHub не обновляет установленный агент. Не добавлять private start-turn, steer, interrupt, approval или запись в БД.
 
 Snapshot владельца подтверждает состояние работающего UI, но не визуальный фокус. Не заявлять переключение видимой вкладки без отдельного наблюдения интерфейса.

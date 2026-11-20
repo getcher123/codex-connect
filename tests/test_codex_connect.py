@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from unittest import mock
 
@@ -336,7 +337,7 @@ class IPCRegressionTests(unittest.TestCase):
     def test_zero_oversized_and_nonobject_frames_are_rejected(self):
         cases = [
             (struct.pack("<I", 0), "frame_too_large"),
-            (struct.pack("<I", cc.MAX_FRAME + 1), "frame_too_large"),
+            (struct.pack("<I", cc.MAX_RECEIVE_FRAME + 1), "frame_too_large"),
             (struct.pack("<I", 1) + b"{", "invalid_frame"),
             (wire_frame(["not", "an", "object"]), "invalid_frame"),
         ]
@@ -437,7 +438,7 @@ class SendIntegrationRegressionTests(unittest.TestCase):
                                                    "--message", "Synthetic prompt"])
                 read_args = cc.parser().parse_args(["--socket", str(custom_socket), "read", "--thread", THREAD_ID])
             with mock.patch.object(cc, "IPCClient", return_value=client) as make_client, \
-                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex"}), \
+                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex", "queue_supported": True}), \
                     mock.patch.object(cc, "queue_message", return_value={"phase": "queued"}) as queue:
                 with self.assertRaises(cc.BridgeError) as raised:
                     cc.run(send_args)
@@ -482,7 +483,7 @@ class SendIntegrationRegressionTests(unittest.TestCase):
             with mock.patch.object(cc.time, "time", return_value=1.0) as clock, \
                     mock.patch.object(cc.time, "sleep"), \
                     mock.patch.object(cc, "IPCClient", return_value=client), \
-                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex"}), \
+                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex", "queue_supported": True}), \
                     mock.patch.object(cc, "queue_message") as queue:
                 def accept_once(*args, **kwargs):
                     clock.return_value = 2.0
@@ -509,7 +510,7 @@ class SendIntegrationRegressionTests(unittest.TestCase):
                                            "--message", "Synthetic prompt", "--wait", "1"])
             with mock.patch.object(cc.time, "sleep"), \
                     mock.patch.object(cc, "IPCClient", return_value=client), \
-                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex"}), \
+                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex", "queue_supported": True}), \
                     mock.patch.object(cc, "queue_message", return_value=accepted) as queue:
                 receipt = cc.run(args)
         self.assertEqual(queue.call_count, 1)
@@ -532,7 +533,7 @@ class SendIntegrationRegressionTests(unittest.TestCase):
             args = cc.parser().parse_args(["--codex-home", str(home), "send", "--thread", THREAD_ID,
                                            "--message-file", str(message_file)])
             with mock.patch.object(cc, "IPCClient", return_value=client), \
-                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex"}), \
+                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex", "queue_supported": True}), \
                     mock.patch.object(cc, "queue_message", return_value=accepted) as queue:
                 cc.run(args)
         self.assertEqual(queue.call_count, 1)
@@ -552,7 +553,7 @@ class SendIntegrationRegressionTests(unittest.TestCase):
             args = cc.parser().parse_args(["--codex-home", str(home), "send", "--thread", THREAD_ID,
                                            "--message", prompt, "--wait", "1", "--expect-cwd", CWD])
             with mock.patch.object(cc, "IPCClient", return_value=client), \
-                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex"}), \
+                    mock.patch.object(cc, "detect_bundled_cli", return_value={"path": "/synthetic/bin/codex", "queue_supported": True}), \
                     mock.patch.object(cc.subprocess, "run", return_value=accepted) as invoke:
                 result = cc.run(args)
         self.assertEqual(invoke.call_count, 1)
@@ -576,6 +577,187 @@ class SendIntegrationRegressionTests(unittest.TestCase):
                     self.assertEqual(raised.exception.code, code)
                     queue.assert_not_called()
                     client.assert_not_called()
+
+
+class ReliabilityRegressionTests(unittest.TestCase):
+    def test_cleanup_has_one_shared_budget_and_stops_after_socket_failure(self):
+        for blocked in (False, True):
+            with self.subTest(blocked=blocked):
+                client = cc.IPCClient("/synthetic/ipc.sock", timeout=1)
+                stream = mock.Mock()
+                client.sock = stream
+                client.following = {(str(index), "owner") for index in range(200)}
+                clock = [0.0]
+                def send(_frame):
+                    clock[0] += 0.11
+                    if blocked:
+                        raise socket.timeout("Synthetic blocked unsubscribe")
+                stream.sendall.side_effect = send
+                with mock.patch.object(cc.time, "monotonic", side_effect=lambda: clock[0]):
+                    client.close()
+                self.assertEqual(stream.sendall.call_count, 1 if blocked else 2)
+                self.assertLessEqual(max(call.args[0] for call in stream.settimeout.call_args_list), 0.2)
+                stream.close.assert_called_once()
+                self.assertIsNone(client.sock)
+
+    def test_read_never_invokes_outbound_binary_detection(self):
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.owner.return_value = OWNER
+        client.snapshot.return_value = live_state([visible_turn()])
+        client.last_observation = {"received_at_ms": 1234, "snapshot_version": 13,
+                                   "freshness": "received_in_current_request",
+                                   "source_timestamp_known": False}
+        with synthetic_home() as home:
+            args = cc.parser().parse_args(["--codex-home", str(home), "read", "--thread", THREAD_ID])
+            with mock.patch.object(cc, "IPCClient", return_value=client), \
+                    mock.patch.object(cc, "detect_bundled_cli", side_effect=AssertionError("read must not scan/launch CLI")), \
+                    mock.patch.object(cc.subprocess, "run", side_effect=AssertionError("read must not launch a process")):
+                result = cc.run(args)
+        self.assertEqual(result["thread_id"], THREAD_ID)
+        self.assertEqual(result["observation"]["snapshot_version"], 13)
+        self.assertEqual(result["observation"]["received_at_ms"], 1234)
+
+    def test_status_does_not_walk_history_or_claim_it_was_read(self):
+        state = live_state()
+        state["turnHistory"] = ["Synthetic history deliberately outside status scope"]
+        client = mock.MagicMock()
+        client.__enter__.return_value = client
+        client.snapshot.return_value = state
+        with synthetic_home() as home:
+            args = cc.parser().parse_args(["--codex-home", str(home), "status", "--thread", THREAD_ID])
+            with mock.patch.object(cc, "IPCClient", return_value=client), \
+                    mock.patch.object(cc, "extract_turns", side_effect=AssertionError("status must not walk history")), \
+                    mock.patch.object(cc, "detect_bundled_cli", side_effect=AssertionError("status must not launch CLI")):
+                result = cc.run(args)
+        self.assertFalse(result["history_inspected"])
+        self.assertTrue(result["pending_state_known"])
+        self.assertNotIn("turns", result)
+
+    def test_missing_or_malformed_pending_is_not_reported_empty(self):
+        for value in (None, {}, ["synthetic unknown request"], [{"not_method": "unknown"}]):
+            with self.subTest(value=value):
+                state = live_state()
+                state["requests"] = value
+                result = cc.summarize_metadata(state)
+                self.assertIsNone(result["pending_request_methods"])
+                self.assertFalse(result["pending_state_known"])
+        state = live_state()
+        del state["requests"]
+        self.assertIsNone(cc.summarize_metadata(state)["pending_request_count"])
+        state = live_state()
+        state["unconfirmedTurnSubmissions"] = {"synthetic": {"status": "submitted"}}
+        self.assertEqual(cc.summarize_metadata(state)["unconfirmed_submission_count"], 1)
+        state["unconfirmedTurnSubmissions"] = False
+        self.assertFalse(cc.summarize_metadata(state)["pending_state_known"])
+        self.assertIsNone(cc.summarize_metadata(state)["unconfirmed_submission_count"])
+
+    def test_newest_long_user_message_keeps_budget_before_old_history(self):
+        current = "Новый полный текст\n" + "x" * 32700
+        turns = [visible_turn(str(i), "a" * 32768, "b" * 32768, started=i) for i in range(1, 5)]
+        turns.append(visible_turn("current", current, "Current reply", started=5))
+        result = cc.summarize_state(live_state(turns), limit=5, max_chars=32768)
+        latest = result["turns"][-1]
+        self.assertEqual(latest["messages"][0]["text"], current)
+        self.assertFalse(latest["messages"][0]["truncated"])
+        self.assertEqual(latest["messages"][1]["text"], "Current reply")
+        self.assertLessEqual(sum(len(message["text"]) for turn in result["turns"]
+                                 for message in turn["messages"]), cc.MAX_OUTPUT_CHARS)
+        self.assertTrue(any(message["truncated"] for turn in result["turns"][:-1]
+                            for message in turn["messages"]))
+
+    def test_user_is_retained_when_many_visible_assistant_messages_follow(self):
+        state = live_state([visible_turn(prompt="Exact user message")])
+        state["turns"][0]["items"].extend(
+            {"type": "agentMessage", "id": str(i), "text": f"Synthetic progress {i}"}
+            for i in range(45))
+        shown = cc.summarize_state(state)["turns"][0]["messages"]
+        self.assertEqual(shown[0]["text"], "Exact user message")
+        self.assertEqual(shown[-1]["text"], "Synthetic progress 44")
+        self.assertLessEqual(len(shown), 40)
+
+    def test_expired_shared_deadline_stops_before_another_follow(self):
+        client = cc.IPCClient("/synthetic/ipc.sock", timeout=60, deadline=time.monotonic() - 1)
+        with mock.patch.object(client, "_follow") as follow:
+            with self.assertRaises(cc.BridgeError) as raised:
+                client.snapshot(THREAD_ID, OWNER)
+        self.assertEqual(raised.exception.code, "ipc_timeout")
+        self.assertEqual(raised.exception.details["phase"], "snapshot")
+        self.assertNotIn("outcome", raised.exception.details)
+        follow.assert_not_called()
+
+    def test_current_backend_cannot_use_unvalidated_native_queue(self):
+        with synthetic_home() as home:
+            args = cc.parser().parse_args(["--codex-home", str(home), "send", "--thread", THREAD_ID,
+                                           "--message", "Synthetic message"])
+            backend = {"path": "/synthetic/bin/codex", "queue_supported": False,
+                       "extension_version": cc.EXTENSION_VERSION, "cli_version": cc.CLI_VERSION}
+            with mock.patch.object(cc, "detect_bundled_cli", return_value=backend), \
+                    mock.patch.object(cc, "IPCClient") as client, \
+                    mock.patch.object(cc, "queue_message") as queue:
+                with self.assertRaises(cc.BridgeError) as raised:
+                    cc.run(args)
+        self.assertEqual(raised.exception.code, "queue_transport_unsupported")
+        client.assert_not_called()
+        queue.assert_not_called()
+
+    def test_doctor_does_not_call_existing_socket_healthy_without_response(self):
+        with synthetic_home() as home:
+            args = cc.parser().parse_args(["--codex-home", str(home), "doctor"])
+            with mock.patch.object(cc.Path, "is_socket", return_value=True), \
+                    mock.patch.object(cc, "detect_bundled_cli", return_value={"compatible": True}), \
+                    mock.patch.object(cc, "IPCClient", side_effect=cc.BridgeError("ipc_timeout", "Synthetic no response")):
+                result = cc.run(args)
+        self.assertTrue(result["socket_exists"])
+        self.assertFalse(result["healthy"])
+        self.assertEqual(result["ipc"]["reason"], "ipc_timeout")
+
+    def test_unsupported_process_executables_are_not_resolved(self):
+        unrelated = mock.MagicMock()
+        unrelated.name = "12345"
+        unrelated.__truediv__.return_value.read_bytes.return_value = b"synthetic-worker\0--idle\0"
+        unrelated.__truediv__.return_value.resolve.side_effect = AssertionError("Unrelated executable was resolved")
+        with mock.patch.object(cc, "Path") as path, \
+                mock.patch.object(cc.subprocess, "run") as subprocess_run:
+            path.return_value.is_dir.return_value = True
+            path.return_value.iterdir.return_value = [unrelated]
+            with self.assertRaises(cc.BridgeError) as raised:
+                cc.detect_bundled_cli()
+        self.assertEqual(raised.exception.code, "backend_not_found")
+        unrelated.__truediv__.return_value.resolve.assert_not_called()
+        subprocess_run.assert_not_called()
+
+    def test_documented_msi_read_bounds_are_accepted(self):
+        read = cc.parser().parse_args(["--timeout", "60", "read", "--thread", THREAD_ID,
+                                       "--max-chars", "200000"])
+        self.assertEqual(read.max_chars, 200000)
+        discover = cc.parser().parse_args(["discover", "--limit", "200"])
+        self.assertEqual(discover.limit, 200)
+
+
+class CurrentProtocolFixtureTests(unittest.TestCase):
+    def test_v13_read_returns_fresh_observation_and_known_pending(self):
+        state = live_state([visible_turn(prompt="Synthetic v13 question")])
+        with synthetic_home() as home, FakePeer(protocol_handler([snapshot_frame(state, version=13)])) as peer:
+            args = cc.parser().parse_args(["--codex-home", str(home), "--socket", str(peer.path),
+                                           "read", "--thread", THREAD_ID])
+            result = cc.run(args)
+        self.assertFalse(peer.errors, peer.errors)
+        self.assertEqual(result["observation"]["snapshot_version"], 13)
+        self.assertGreater(result["observation"]["received_at_ms"], 0)
+        self.assertFalse(result["observation"]["source_timestamp_known"])
+        self.assertTrue(result["pending_state_known"])
+        self.assertEqual(result["unconfirmed_submission_count"], 0)
+
+    def test_large_v13_frame_is_bounded_and_does_not_leak_private_content(self):
+        state = live_state([visible_turn(prompt="Visible synthetic input")])
+        state["settings"] = {"synthetic_private_blob": "z" * (cc.MAX_FRAME + 1024)}
+        with FakePeer(protocol_handler([snapshot_frame(state, version=13)])) as peer:
+            with cc.IPCClient(peer.path, timeout=5) as client:
+                summary = cc.summarize_state(client.snapshot(THREAD_ID), max_chars=100)
+        self.assertFalse(peer.errors, peer.errors)
+        self.assertIn("Visible synthetic input", json.dumps(summary))
+        self.assertNotIn("synthetic_private_blob", json.dumps(summary))
 
 
 if __name__ == "__main__":
