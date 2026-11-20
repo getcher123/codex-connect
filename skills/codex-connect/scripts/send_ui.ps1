@@ -55,9 +55,12 @@ function Test-CodexDraft([AllowNull()][string]$Value, [string]$Expected) {
   $crlf = [string][char]13 + [char]10
   $actual = $Value.Replace($crlf, $lf)
   $wanted = $Expected.Replace($crlf, $lf)
-  # UIA may append one contenteditable paragraph terminator. Preserve every
-  # character of the supplied text; Trim() would hide a changed draft.
-  return ($actual -ceq $wanted -or $actual -ceq ($wanted + $lf))
+  # UIA may add a contenteditable paragraph terminator or omit one supplied
+  # terminal LF. Accept only that single boundary difference; never Trim().
+  # Post-submit IPC correlation still requires the full original user text.
+  return ($actual -ceq $wanted -or $actual -ceq ($wanted + $lf) -or
+    ($wanted.EndsWith($lf, [System.StringComparison]::Ordinal) -and
+      $actual -ceq $wanted.Substring(0, $wanted.Length - 1)))
 }
 
 function Find-CodexElements($Root, [string]$Name, $Type) {
