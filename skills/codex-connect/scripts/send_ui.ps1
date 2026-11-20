@@ -3,13 +3,38 @@ param(
   [string]$ExpectedWslDistro,
   [string]$MessageFile,
   [string]$ExpectedMessageSha256,
-  [switch]$ProbeOnly
+  [switch]$ProbeOnly,
+  [long]$UiDeadlineUnixMs,
+  [long]$UiBudgetMilliseconds
 )
 
 # Dot-sourcing defines the same pure guard functions used by the live route.
 # It does not enumerate windows, load UIAutomation, or acquire the desktop lock.
 function Stop-CodexUi([string]$Code) {
   throw ("CODEX_UI:" + $Code)
+}
+
+function Test-CodexUiDeadline([long]$NowUnixMs, [long]$DeadlineUnixMs,
+    [double]$ElapsedMs, [double]$BudgetMs) {
+  return ($NowUnixMs -lt $DeadlineUnixMs -and $ElapsedMs -ge 0 -and
+    $BudgetMs -gt 0 -and $ElapsedMs -lt $BudgetMs -and
+    -not [double]::IsInfinity($BudgetMs))
+}
+
+function Assert-CodexUiDeadline {
+  if ($null -eq $script:CodexUiTimer -or -not (Test-CodexUiDeadline `
+      ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) $script:CodexUiDeadlineUnixMs `
+      $script:CodexUiTimer.Elapsed.TotalMilliseconds $script:CodexUiBudgetMilliseconds)) {
+    Stop-CodexUi 'UI_DEADLINE_EXCEEDED'
+  }
+}
+
+function Invoke-CodexUiAction([scriptblock]$Action) {
+  # Fetch UIA patterns before entering this guard: a late RPC must not be
+  # followed by a fresh action after the deadline. Never retry an action.
+  Assert-CodexUiDeadline
+  & $Action
+  Assert-CodexUiDeadline
 }
 
 function Select-CodexWindow($Inventory, [string]$Distro) {
@@ -83,6 +108,7 @@ function Get-CodexTargetDocument($Root, [string]$Title) {
 }
 
 function Get-CodexWindowInventory([string]$Title) {
+  Assert-CodexUiDeadline
   $ids = @(Get-Process -Name Code -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
   $roots = [System.Windows.Automation.AutomationElement]::RootElement.FindAll(
     [System.Windows.Automation.TreeScope]::Children,
@@ -90,6 +116,7 @@ function Get-CodexWindowInventory([string]$Title) {
   )
   $result = @()
   foreach ($item in $roots) {
+    Assert-CodexUiDeadline
     try { $current = $item.Current } catch { continue }
     if ($ids -notcontains $current.ProcessId -or
         $current.ControlType -ne [System.Windows.Automation.ControlType]::Window -or
@@ -131,6 +158,7 @@ function Get-CodexWindowInventory([string]$Title) {
     }
   }
   $script:CodexUiLastInventory = $result
+  Assert-CodexUiDeadline
   return $result
 }
 
@@ -186,7 +214,8 @@ function Search-ExistingCodexChatEntry([long]$Handle, [string]$Title, [string]$D
   $recent = @($root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $buttonType) |
     Where-Object { -not $_.Current.IsOffscreen -and $_.Current.IsEnabled -and $_.Current.Name -cmatch '^Recent chats[.]' })
   if ($recent.Count -ne 1) { Stop-CodexUi 'RECENT_CHATS_NOT_UNIQUE' }
-  $recent[0].GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern).Expand()
+  $recentPattern = $recent[0].GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+  Invoke-CodexUiAction { $recentPattern.Expand() }
   $searchCondition = New-Object System.Windows.Automation.PropertyCondition(
     [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'recent-tasks-search'
   )
@@ -200,7 +229,8 @@ function Search-ExistingCodexChatEntry([long]$Handle, [string]$Title, [string]$D
     if ($search.Count -gt 1) { Stop-CodexUi 'RECENT_SEARCH_AMBIGUOUS' }
   }
   if ($search.Count -ne 1) { Stop-CodexUi 'RECENT_SEARCH_UNAVAILABLE' }
-  $search[0].GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern).SetValue($Title)
+  $searchPattern = $search[0].GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
+  Invoke-CodexUiAction { $searchPattern.SetValue($Title) }
   $menuType = New-Object System.Windows.Automation.PropertyCondition(
     [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
     [System.Windows.Automation.ControlType]::Menu
@@ -245,7 +275,8 @@ function Open-ExistingCodexChat([long]$Handle, [string]$Title, [string]$Distro) 
   $back = @(Find-CodexElements $root 'Back' ([System.Windows.Automation.ControlType]::Button) |
     Where-Object { -not $_.Current.IsOffscreen -and $_.Current.IsEnabled })
   if ($back.Count -eq 1) {
-    $back[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    $backPattern = $back[0].GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    Invoke-CodexUiAction { $backPattern.Invoke() }
   } elseif ($back.Count -gt 1) {
     Stop-CodexUi 'CHAT_NAVIGATION_AMBIGUOUS'
   }
@@ -261,7 +292,7 @@ function Open-ExistingCodexChat([long]$Handle, [string]$Title, [string]$Distro) 
       if ($buttons[0].Current.IsOffscreen) {
         $scroll = $null
         if ($buttons[0].TryGetCurrentPattern([System.Windows.Automation.ScrollItemPattern]::Pattern, [ref]$scroll)) {
-          $scroll.ScrollIntoView()
+          Invoke-CodexUiAction { $scroll.ScrollIntoView() }
         }
       }
       if (-not $buttons[0].Current.IsOffscreen -and $buttons[0].Current.IsEnabled) { break }
@@ -274,9 +305,9 @@ function Open-ExistingCodexChat([long]$Handle, [string]$Title, [string]$Distro) 
   $invoke = $null
   $selection = $null
   if ($buttons[0].TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$invoke)) {
-    $invoke.Invoke()
+    Invoke-CodexUiAction { $invoke.Invoke() }
   } elseif ($buttons[0].TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$selection)) {
-    $selection.Select()
+    Invoke-CodexUiAction { $selection.Select() }
   } else {
     Stop-CodexUi 'CHAT_ENTRY_ACTION_UNAVAILABLE'
   }
@@ -298,9 +329,20 @@ function Invoke-CodexUiMain {
   $lastPhase = 'preflight'
   $hash = $null
   $script:CodexUiLastInventory = @()
+  $script:CodexUiTimer = [System.Diagnostics.Stopwatch]::StartNew()
+  $deadlineActive = $false
   try {
     if ([string]::IsNullOrWhiteSpace($ExpectedTitle) -or
         [string]::IsNullOrWhiteSpace($ExpectedWslDistro)) { Stop-CodexUi 'TARGET_CONTEXT_REQUIRED' }
+    if ($UiDeadlineUnixMs -le 0 -or $UiBudgetMilliseconds -lt 0 -or
+        $UiBudgetMilliseconds -gt 81000) { Stop-CodexUi 'UI_DEADLINE_REQUIRED' }
+    $script:CodexUiDeadlineUnixMs = $UiDeadlineUnixMs
+    # Absolute UTC includes PowerShell startup. The monotonic limit additionally
+    # prevents a backwards clock change from extending this operation.
+    $script:CodexUiBudgetMilliseconds = [Math]::Min([double]$UiBudgetMilliseconds,
+      [double]($UiDeadlineUnixMs - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()))
+    $deadlineActive = $true
+    Assert-CodexUiDeadline
     $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     $mutex = New-Object System.Threading.Mutex($false, ('Local\CodexConnect.UiInput.' + $sid))
     try { $ownsMutex = $mutex.WaitOne(0) }
@@ -322,7 +364,7 @@ public static class CodexConnectUiHost {
     $selected = Select-CodexWindow $inventory $ExpectedWslDistro
     $handle = $selected.Handle
     if ([CodexConnectUiHost]::IsIconic([IntPtr]$handle)) {
-      [CodexConnectUiHost]::ShowWindow([IntPtr]$handle, 9) | Out-Null
+      Invoke-CodexUiAction { [CodexConnectUiHost]::ShowWindow([IntPtr]$handle, 9) | Out-Null }
       Start-Sleep -Milliseconds 300
     }
     Open-ExistingCodexChat $handle $ExpectedTitle $ExpectedWslDistro
@@ -333,6 +375,7 @@ public static class CodexConnectUiHost {
     if (-not (Test-EmptyCodexComposer $composer.Value $composer.Send.Current.IsEnabled)) {
       Stop-CodexUi 'USER_DRAFT_PRESENT'
     }
+    Assert-CodexUiDeadline
     $lastPhase = 'ui_ready'
     if ($ProbeOnly) {
       return @{ ExitCode = 0; Result = @{
@@ -363,7 +406,7 @@ public static class CodexConnectUiHost {
     # Any error from this point may leave a draft. Never erase it automatically.
     $staged = $true
     $lastPhase = 'staging_started'
-    $composer.Pattern.SetValue($message)
+    Invoke-CodexUiAction { $composer.Pattern.SetValue($message) }
     $ready = $false
     for ($i = 0; $i -lt 12; $i++) {
       Start-Sleep -Milliseconds 100
@@ -386,10 +429,12 @@ public static class CodexConnectUiHost {
     if (-not (Test-CodexDraft $composer.Value $message) -or -not $composer.Send.Current.IsEnabled) {
       Stop-CodexUi 'DRAFT_CHANGED_BEFORE_SUBMIT'
     }
+    $sendPattern = $composer.Send.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    Assert-CodexUiDeadline
     $submitAttempted = $true
     $lastPhase = 'submit_started'
     $submitStartedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $composer.Send.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+    Invoke-CodexUiAction { $sendPattern.Invoke() }
     $lastPhase = 'ui_invoked'
     return @{ ExitCode = 0; Result = @{
       phase = 'ui_invoked'; outcome = 'unknown'; submit_attempted = $true;
@@ -399,13 +444,23 @@ public static class CodexConnectUiHost {
   } catch {
     $reason = 'UI_AUTOMATION_ERROR'
     if ($_.Exception.Message -cmatch '^CODEX_UI:([A-Z0-9_]+)$') { $reason = $Matches[1] }
+    if ($deadlineActive -and -not (Test-CodexUiDeadline `
+        ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) $script:CodexUiDeadlineUnixMs `
+        $script:CodexUiTimer.Elapsed.TotalMilliseconds $script:CodexUiBudgetMilliseconds)) {
+      $reason = 'UI_DEADLINE_EXCEEDED'
+    }
     $phase = 'failed_before_send'
     $outcome = 'not_sent'
     if ($staged) { $phase = 'staged_not_submitted' }
     if ($submitAttempted) { $phase = 'outcome_unknown'; $outcome = 'unknown' }
+    $timedOut = $reason -ceq 'UI_DEADLINE_EXCEEDED'
+    if ($timedOut) {
+      $phase = 'outcome_unknown'; $outcome = 'unknown'; $submitAttempted = $null
+    }
     return @{ ExitCode = 3; Result = @{
       phase = $phase; outcome = $outcome; submit_attempted = $submitAttempted;
       last_confirmed_phase = $lastPhase; reason = $reason; error_code = $reason;
+      inner_ui_timed_out = $timedOut;
       message_sha256 = $hash; draft_preserved = $true; retry_safe = $false;
       window_candidate_count = @($script:CodexUiLastInventory).Count;
       window_candidates = @(Get-CodexWindowSummary $script:CodexUiLastInventory $ExpectedWslDistro)

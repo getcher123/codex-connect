@@ -194,6 +194,55 @@ class CorrelationTests(unittest.TestCase):
 
 
 class InvocationTests(unittest.TestCase):
+    def test_ui_budget_uses_remaining_helper_time_with_return_margins(self):
+        budget = ui.ui_time_budget(139, 100, 1700000000)
+        self.assertEqual(budget["hard_timeout_seconds"], 38)
+        self.assertEqual(budget["soft_deadline_unix_ms"], 1700000036000)
+        self.assertEqual(budget["soft_budget_ms"], 36000)
+        for available in (-1, 0, 2.9, 3):
+            with self.subTest(available=available), self.assertRaises(ui.UiSendError) as caught:
+                ui.ui_time_budget(100 + available, 100, 1700000000)
+            self.assertEqual(caught.exception.result["error_code"], "UI_BUDGET_EXHAUSTED")
+
+    def test_exhausted_prelaunch_budget_does_not_start_process(self):
+        with context() as (args, _):
+            ui.validate_input(args)
+            with mock.patch.object(ui, "windows_path", side_effect=lambda path, deadline: str(path)), \
+                 mock.patch.object(ui.shutil, "which", return_value="synthetic-powershell"), \
+                 mock.patch.object(ui.time, "monotonic", return_value=100), \
+                 mock.patch.object(ui.subprocess, "run") as call:
+                with self.assertRaises(ui.UiSendError) as caught:
+                    ui.invoke_ui(args, TEXT.encode(), "a" * 64, 103)
+            call.assert_not_called()
+            self.assertEqual(caught.exception.result["outcome"], "not_sent")
+            self.assertFalse(caught.exception.result["submit_attempted"])
+
+    def test_probe_navigation_can_exceed_old_sixteen_second_cap(self):
+        with context() as (args, _):
+            ui.validate_input(args)
+            args.probe = True
+            clock = [100.0]
+            def fake_run(argv, **kwargs):
+                self.assertIn("-ProbeOnly", argv)
+                self.assertEqual(kwargs["timeout"], 38)
+                self.assertEqual(argv[argv.index("-UiDeadlineUnixMs") + 1], "1700000036000")
+                self.assertEqual(argv[argv.index("-UiBudgetMilliseconds") + 1], "36000")
+                clock[0] += 26.245
+                return subprocess.CompletedProcess(argv, 0, json.dumps({
+                    "phase": "ui_ready", "outcome": "not_sent", "submit_attempted": False,
+                    "last_confirmed_phase": "ui_ready",
+                }), "")
+            with mock.patch.object(ui, "windows_path", side_effect=lambda path, deadline: str(path)), \
+                 mock.patch.object(ui.shutil, "which", return_value="synthetic-powershell"), \
+                 mock.patch.object(ui.time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(ui.time, "time", return_value=1700000000), \
+                 mock.patch.object(ui.subprocess, "run", side_effect=fake_run) as call:
+                result = ui.invoke_ui(args, TEXT.encode(), "a" * 64, 139)
+            self.assertEqual(call.call_count, 1)
+            self.assertEqual(result["phase"], "ui_ready")
+            self.assertFalse(result["inner_ui_timed_out"])
+            self.assertGreaterEqual(result["ui_elapsed_ms"], 26244)
+
     def test_ps_timeout_is_unknown_and_never_retries(self):
         with context() as (args, _):
             ui.validate_input(args)
@@ -204,6 +253,10 @@ class InvocationTests(unittest.TestCase):
                     ui.invoke_ui(args, TEXT.encode(), hashlib.sha256(TEXT.encode()).hexdigest(), time.monotonic() + 10)
                 self.assertEqual(caught.exception.result["outcome"], "unknown")
                 self.assertIsNone(caught.exception.result["submit_attempted"])
+                self.assertEqual(caught.exception.result["error_code"], "UI_PROCESS_TIMEOUT")
+                self.assertEqual(caught.exception.result["cause"], "TimeoutExpired")
+                self.assertTrue(caught.exception.result["inner_ui_timed_out"])
+                self.assertGreaterEqual(caught.exception.result["ui_elapsed_ms"], 0)
                 self.assertEqual(call.call_count, 1)
 
     def test_oserror_without_separate_creation_proof_stays_unknown(self):
@@ -216,6 +269,27 @@ class InvocationTests(unittest.TestCase):
                     ui.invoke_ui(args, TEXT.encode(), "a" * 64, time.monotonic() + 10)
                 self.assertEqual(caught.exception.result["outcome"], "unknown")
                 self.assertIsNone(caught.exception.result["submit_attempted"])
+                self.assertEqual(caught.exception.result["error_code"], "UI_PROCESS_IO_ERROR")
+                self.assertEqual(caught.exception.result["cause"], "OSError")
+                self.assertFalse(caught.exception.result["inner_ui_timed_out"])
+
+    def test_ps_soft_deadline_stays_unknown_even_before_submit(self):
+        with context() as (args, _):
+            ui.validate_input(args)
+            value = {
+                "phase": "outcome_unknown", "outcome": "unknown", "submit_attempted": None,
+                "last_confirmed_phase": "staging_started", "error_code": "UI_DEADLINE_EXCEEDED",
+                "reason": "UI_DEADLINE_EXCEEDED", "inner_ui_timed_out": True,
+            }
+            with mock.patch.object(ui, "windows_path", side_effect=lambda path, deadline: str(path)), \
+                 mock.patch.object(ui.shutil, "which", return_value="synthetic-powershell"), \
+                 mock.patch.object(ui.subprocess, "run", return_value=subprocess.CompletedProcess([], 3, json.dumps(value), "")) as call:
+                result = ui.invoke_ui(args, TEXT.encode(), "a" * 64, time.monotonic() + 30)
+            self.assertEqual(call.call_count, 1)
+            self.assertEqual(result["outcome"], "unknown")
+            self.assertIsNone(result["submit_attempted"])
+            self.assertTrue(result["inner_ui_timed_out"])
+            self.assertEqual(result["last_confirmed_phase"], "staging_started")
 
     def test_communication_oserror_after_child_effect_stays_unknown(self):
         with context() as (args, home):
@@ -340,6 +414,25 @@ class InvocationTests(unittest.TestCase):
                 result = ui.run(args)
             self.assertEqual(result["phase"], "observed")
             self.assertEqual(calls, 2)
+
+    def test_slow_ui_shortens_observation_to_existing_helper_deadline(self):
+        with context() as (args, _):
+            args.wait = 15
+            clock = [100.0]
+            deadlines = []
+            def fake_snapshot(unused_args, deadline):
+                deadlines.append(deadline)
+                return state() if len(deadlines) == 1 else state([turn()])
+            def fake_invoke(*unused):
+                clock[0] = 137.5
+                return {"phase": "ui_invoked", "submit_attempted": True, "outcome": "unknown",
+                        "last_confirmed_phase": "ui_invoked", "enqueue_started_at_ms": 1000}
+            with mock.patch.object(ui.time, "monotonic", side_effect=lambda: clock[0]), \
+                 mock.patch.object(ui, "snapshot", side_effect=fake_snapshot), \
+                 mock.patch.object(ui, "invoke_ui", side_effect=fake_invoke):
+                result = ui.run(args)
+            self.assertEqual(result["phase"], "observed")
+            self.assertEqual(deadlines, [139, 139])
 
 
 if __name__ == "__main__":
